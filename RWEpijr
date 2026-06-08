@@ -19,6 +19,7 @@ from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from aiogram.types import InlineKeyboardButton, ReplyKeyboardMarkup, KeyboardButton
 from aiogram.filters import Command
+from aiogram import BaseMiddleware
 
 logging.basicConfig(level=logging.INFO)
 
@@ -30,6 +31,58 @@ AUTHORIZED_USERS_FILE = "authorized_users.json"
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
+
+# ==================== MIDDLEWARE АВТОРИЗАЦИИ ====================
+
+class AuthMiddleware(BaseMiddleware):
+    async def __call__(self, handler, event, data):
+        # Определяем user_id
+        if isinstance(event, types.Message):
+            user_id = event.from_user.id
+            state = data.get('state')
+            
+            # Проверяем авторизацию
+            if not is_authorized(user_id):
+                # Если это команда /start
+                if event.text == '/start':
+                    await event.answer(
+                        "🔐 <b>ДОСТУП ОГРАНИЧЕН</b>\n\n"
+                        "Для использования бота необходимо ввести пароль.\n"
+                        "Пароль можно получить у @elite_wtc\n\n"
+                        "<b>Введите пароль:</b>",
+                        parse_mode="HTML"
+                    )
+                    if state:
+                        await state.set_state(AuthState.waiting_for_password)
+                    return
+                
+                # Если это состояние ввода пароля
+                current_state = await state.get_state() if state else None
+                if current_state == AuthState.waiting_for_password:
+                    return await handler(event, data)
+                
+                # ВСЁ ОСТАЛЬНОЕ - ЗАПРЕЩЕНО
+                await event.answer(
+                    "🔐 <b>ДОСТУП ЗАПРЕЩЕН!</b>\n\n"
+                    "Вы не авторизованы.\n"
+                    "Используйте /start и введите пароль.\n"
+                    "Пароль можно получить у @elite_wtc",
+                    parse_mode="HTML"
+                )
+                return
+        
+        elif isinstance(event, types.CallbackQuery):
+            user_id = event.from_user.id
+            
+            if not is_authorized(user_id):
+                await event.answer("❌ Вы не авторизованы! Используйте /start", show_alert=True)
+                return
+        
+        # Если авторизован - пропускаем дальше
+        return await handler(event, data)
+
+# Регистрируем middleware
+dp.update.middleware(AuthMiddleware())
 
 # ==================== MAX PROTOCOL ====================
 
@@ -414,17 +467,14 @@ def admin_keyboard():
     builder.row(InlineKeyboardButton(text="📊 Статистика", callback_data="stats"))
     return builder.as_markup()
 
-# ==================== ЕДИНСТВЕННАЯ ТОЧКА ВХОДА ====================
+# ==================== ХЕНДЛЕРЫ (только для авторизованных) ====================
 
 @dp.message(Command("start"))
 async def start(message: types.Message, state: FSMContext):
     user_id = message.from_user.id
-    
-    # Всегда сбрасываем состояние при /start
     await state.clear()
     
     if is_authorized(user_id):
-        # Пользователь уже авторизован
         is_admin = user_id == ADMIN_ID
         kb = admin_keyboard() if is_admin else main_keyboard()
         await message.answer(
@@ -436,7 +486,6 @@ async def start(message: types.Message, state: FSMContext):
             reply_markup=kb
         )
     else:
-        # Требуем пароль
         await state.set_state(AuthState.waiting_for_password)
         await message.answer(
             "🔐 <b>ДОСТУП ОГРАНИЧЕН</b>\n\n"
@@ -445,8 +494,6 @@ async def start(message: types.Message, state: FSMContext):
             "<b>Введите пароль:</b>",
             parse_mode="HTML"
         )
-
-# ==================== ПРОВЕРКА ПАРОЛЯ ====================
 
 @dp.message(AuthState.waiting_for_password)
 async def check_password(message: types.Message, state: FSMContext):
@@ -471,114 +518,116 @@ async def check_password(message: types.Message, state: FSMContext):
     else:
         await message.answer(
             "❌ <b>НЕВЕРНЫЙ ПАРОЛЬ!</b>\n\n"
-            "Попробуйте еще раз или получите пароль у @elite_wtc\n\n"
-            "<b>Введите пароль:</b>",
-            parse_mode="HTML"
-        )
-        logging.warning(f"[AUTH] Failed authorization attempt from {message.from_user.id}")
-
-# ==================== ГЛАВНЫЙ ФИЛЬТР ВСЕХ СООБЩЕНИЙ ====================
-
-@dp.message()
-async def main_filter(message: types.Message, state: FSMContext):
-    user_id = message.from_user.id
-    
-    # ЖЕСТКАЯ ПРОВЕРКА: если не авторизован - шлем нахуй
-    if not is_authorized(user_id):
-        await state.set_state(AuthState.waiting_for_password)
-        await message.answer(
-            "🔐 <b>ДОСТУП ЗАПРЕЩЕН!</b>\n\n"
-            "Вы не авторизованы. Введите пароль для доступа.\n"
+            "Попробуйте еще раз.\n"
             "Пароль можно получить у @elite_wtc\n\n"
             "<b>Введите пароль:</b>",
             parse_mode="HTML"
         )
+        logging.warning(f"[AUTH] Failed authorization from {message.from_user.id}")
+
+# Обработчик callback для scan_qr
+@dp.callback_query(F.data == "scan_qr")
+async def cb_scan_qr(callback: types.CallbackQuery, state: FSMContext):
+    if not accounts:
+        await callback.answer("❌ Нет доступных аккаунтов", show_alert=True)
         return
     
-    # Если авторизован - обрабатываем сообщение
-    current_state = await state.get_state()
-    
-    # Обработка фото QR
-    if current_state == AuthState.waiting_for_qr and message.photo:
-        await process_qr_photo(message, state)
-        return
-    
-    # Обработка документов (только для админа)
-    if message.document:
-        if user_id == ADMIN_ID:
-            await process_document(message)
-        else:
-            await message.answer("❌ Только администратор может загружать токены")
-        return
-    
-    # Любое другое сообщение от авторизованного пользователя
-    await message.answer(
-        "Используйте кнопки меню для управления ботом.\n"
-        "Или отправьте /start для перезапуска."
+    await state.set_state(AuthState.waiting_for_qr)
+    await callback.message.answer(
+        "📷 Отправьте <b>фотографию QR-кода</b>.\n\n"
+        "Бот распознает QR и отсканирует его.",
+        parse_mode="HTML"
     )
+    await callback.answer()
 
-# ==================== ГЛАВНЫЙ ФИЛЬТР ВСЕХ CALLBACK ====================
+# Обработчик callback для my_stats
+@dp.callback_query(F.data == "my_stats")
+async def cb_my_stats(callback: types.CallbackQuery):
+    total = len(accounts)
+    await callback.answer(f"Доступно аккаунтов: {total}", show_alert=True)
 
-@dp.callback_query()
-async def main_callback_filter(callback: types.CallbackQuery, state: FSMContext):
-    user_id = callback.from_user.id
-    
-    # ЖЕСТКАЯ ПРОВЕРКА: если не авторизован - шлем нахуй
-    if not is_authorized(user_id):
-        await callback.answer("❌ Вы не авторизованы! Используйте /start", show_alert=True)
+# Обработчик callback для upload_tokens (админ)
+@dp.callback_query(F.data == "upload_tokens")
+async def cb_upload_tokens(callback: types.CallbackQuery):
+    if callback.from_user.id != ADMIN_ID:
+        await callback.answer("❌ Только для админа", show_alert=True)
         return
     
-    # Обработка callback в зависимости от data
-    if callback.data == "upload_tokens":
-        if user_id != ADMIN_ID:
-            await callback.answer("❌ Только для админа", show_alert=True)
-            return
-        await callback.message.answer(
-            "📦 Отправьте файл с токенами:\n\n"
-            "Поддерживаемые форматы:\n"
-            "• <b>.json</b> — одиночный токен или массив\n"
-            "• <b>.txt</b> — токены построчно\n"
-            "• <b>.zip</b> — архив с .txt/.json файлами",
-            parse_mode="HTML"
-        )
-        await callback.answer()
-        
-    elif callback.data == "stats":
-        if user_id != ADMIN_ID:
-            await callback.answer("❌ Только для админа", show_alert=True)
-            return
-        total = len(accounts)
-        total_scans = sum(a.get("total_scans", 0) for a in accounts.values())
-        text = f"📊 <b>Статистика</b>\n\n👥 Аккаунтов: <b>{total}</b>\n📷 Всего сканов: <b>{total_scans}</b>"
-        if accounts:
-            text += "\n\n<b>Последние 5 аккаунтов:</b>"
-            for i, (acc_id, acc) in enumerate(list(accounts.items())[-5:]):
-                text += f"\n• {acc['phone']} — сканов: {acc.get('total_scans', 0)}"
-        await callback.message.answer(text, parse_mode="HTML")
-        await callback.answer()
-        
-    elif callback.data == "my_stats":
-        total = len(accounts)
-        await callback.answer(f"Доступно аккаунтов: {total}", show_alert=True)
-        
-    elif callback.data == "scan_qr":
-        if not accounts:
-            await callback.answer("❌ Нет доступных аккаунтов", show_alert=True)
-            return
-        await state.set_state(AuthState.waiting_for_qr)
-        await callback.message.answer(
-            "📷 Отправьте <b>фотографию QR-кода</b>.\n\n"
-            "Бот распознает QR и отсканирует его.",
-            parse_mode="HTML"
-        )
-        await callback.answer()
+    await callback.message.answer(
+        "📦 Отправьте файл с токенами:\n\n"
+        "Поддерживаемые форматы:\n"
+        "• <b>.json</b> — одиночный токен или массив\n"
+        "• <b>.txt</b> — токены построчно\n"
+        "• <b>.zip</b> — архив с .txt/.json файлами",
+        parse_mode="HTML"
+    )
+    await callback.answer()
 
-# ==================== ОБРАБОТЧИКИ ФУНКЦИЙ ====================
+# Обработчик callback для stats (админ)
+@dp.callback_query(F.data == "stats")
+async def cb_stats(callback: types.CallbackQuery):
+    if callback.from_user.id != ADMIN_ID:
+        await callback.answer("❌ Только для админа", show_alert=True)
+        return
+    
+    total = len(accounts)
+    total_scans = sum(a.get("total_scans", 0) for a in accounts.values())
+    text = f"📊 <b>Статистика</b>\n\n👥 Аккаунтов: <b>{total}</b>\n📷 Всего сканов: <b>{total_scans}</b>"
+    
+    if accounts:
+        text += "\n\n<b>Последние 5 аккаунтов:</b>"
+        for i, (acc_id, acc) in enumerate(list(accounts.items())[-5:]):
+            text += f"\n• {acc['phone']} — сканов: {acc.get('total_scans', 0)}"
+    
+    await callback.message.answer(text, parse_mode="HTML")
+    await callback.answer()
 
-async def process_document(message: types.Message):
+# Обработчик фото (только в состоянии waiting_for_qr)
+@dp.message(AuthState.waiting_for_qr, F.photo)
+async def handle_qr_photo(message: types.Message, state: FSMContext):
+    msg = await message.answer("⏳ Распознаю QR-код...")
+    
+    try:
+        photo = message.photo[-1]
+        file = await bot.get_file(photo.file_id)
+        file_bytes = await bot.download_file(file.file_path)
+        
+        files = {'file': ('qr.png', file_bytes.read())}
+        
+        response = requests.post(
+            'https://api.qrserver.com/v1/read-qr-code/',
+            files=files,
+            timeout=10
+        )
+        
+        qr_data = None
+        try:
+            data = response.json()
+            if data and isinstance(data, list) and len(data) > 0:
+                symbol = data[0].get("symbol", [])
+                if symbol and len(symbol) > 0:
+                    qr_data = symbol[0].get("data", "")
+        except:
+            pass
+        
+        if qr_data:
+            await process_qr_scan(message, state, qr_data, msg)
+            return
+        
+        await msg.edit_text("❌ QR-код не найден на фото. Попробуйте другое фото.")
+        
+    except Exception as e:
+        logging.error(f"[QR] Error: {e}")
+        await msg.edit_text(f"❌ Ошибка распознавания: {e}")
+
+# Обработчик документов (админ)
+@dp.message(F.document)
+async def handle_document(message: types.Message):
+    if message.from_user.id != ADMIN_ID:
+        return  # middleware уже проверил авторизацию, но это не админ
+    
     doc = message.document
     file_name = doc.file_name.lower()
-    logging.info(f"[FILE] Received: {file_name}")
     
     if not file_name.endswith(('.txt', '.json', '.zip')):
         await message.answer("❌ Отправьте файл .txt, .json или .zip")
@@ -624,63 +673,7 @@ async def process_document(message: types.Message):
         logging.error(f"[FILE] Error: {e}")
         await msg.edit_text(f"❌ Ошибка обработки файла: {e}")
 
-async def process_qr_photo(message: types.Message, state: FSMContext):
-    msg = await message.answer("⏳ Распознаю QR-код...")
-    logging.info(f"[QR] Photo received from {message.from_user.id}")
-    
-    try:
-        photo = message.photo[-1]
-        file = await bot.get_file(photo.file_id)
-        file_bytes = await bot.download_file(file.file_path)
-        
-        files = {'file': ('qr.png', file_bytes.read())}
-        
-        response = requests.post(
-            'https://api.qrserver.com/v1/read-qr-code/',
-            files=files,
-            timeout=10
-        )
-        
-        qr_data = None
-        try:
-            data = response.json()
-            logging.info(f"[QR] API response: {data}")
-            if data and isinstance(data, list) and len(data) > 0:
-                symbol = data[0].get("symbol", [])
-                if symbol and len(symbol) > 0:
-                    qr_data = symbol[0].get("data", "")
-        except:
-            pass
-        
-        if not qr_data:
-            logging.info("[QR] Trying goqr.me API...")
-            response = requests.post(
-                'https://api.goqr.me/read-qr-code/',
-                files=files,
-                timeout=10
-            )
-            try:
-                data = response.json()
-                logging.info(f"[QR] goqr response: {data}")
-                if data and isinstance(data, list) and len(data) > 0:
-                    qr_data = data[0].get("data", "")
-            except:
-                pass
-        
-        if qr_data:
-            logging.info(f"[QR] Decoded data: {qr_data}")
-            await process_qr_scan(message, state, qr_data, msg)
-            return
-        
-        logging.warning("[QR] Both APIs failed")
-        await msg.edit_text("❌ QR-код не найден на фото. Попробуйте другое фото с чётким QR-кодом.")
-        
-    except Exception as e:
-        logging.error(f"[QR] Error: {e}")
-        await msg.edit_text(f"❌ Ошибка распознавания: {e}")
-
 async def process_qr_scan(message: types.Message, state: FSMContext, qr_input: str, msg):
-    logging.info(f"[QR] Processing: {qr_input}")
     qr_link = qr_input
     track_id = None
     
@@ -693,14 +686,6 @@ async def process_qr_scan(message: types.Message, state: FSMContext, qr_input: s
     if not track_id and "/:auth/" in qr_input:
         try:
             track_id = qr_input.split("/:auth/")[1].split("?")[0]
-        except:
-            pass
-    
-    if not track_id and "link/" in qr_input.lower():
-        try:
-            parts = qr_input.split("link/")
-            if len(parts) > 1:
-                track_id = parts[1].split("?")[0].split("/")[0]
         except:
             pass
     
@@ -759,7 +744,7 @@ async def process_qr_scan(message: types.Message, state: FSMContext, qr_input: s
     await state.clear()
 
 async def main():
-    logging.info("QR Scanner Bot запущен!")
+    logging.info("QR Scanner Bot запущен с MIDDLEWARE защитой!")
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
