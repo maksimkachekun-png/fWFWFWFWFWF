@@ -18,7 +18,7 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from aiogram.types import InlineKeyboardButton
-from aiogram.filters import Command, BaseFilter
+from aiogram.filters import Command
 
 logging.basicConfig(level=logging.INFO)
 
@@ -30,18 +30,6 @@ AUTHORIZED_USERS_FILE = "authorized_users.json"
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
-
-# ==================== ФИЛЬТР АВТОРИЗАЦИИ ====================
-
-class IsAuthorized(BaseFilter):
-    async def __call__(self, message: types.Message) -> bool:
-        user_id = message.from_user.id
-        return user_id == ADMIN_ID or user_id in authorized_users
-
-class IsAuthorizedCallback(BaseFilter):
-    async def __call__(self, callback: types.CallbackQuery) -> bool:
-        user_id = callback.from_user.id
-        return user_id == ADMIN_ID or user_id in authorized_users
 
 # ==================== MAX PROTOCOL ====================
 
@@ -426,7 +414,7 @@ def admin_keyboard():
     builder.row(InlineKeyboardButton(text="📊 Статистика", callback_data="stats"))
     return builder.as_markup()
 
-# ==================== ХЕНДЛЕРЫ ====================
+# ==================== ХЕНДЛЕРЫ АВТОРИЗАЦИИ (без проверки) ====================
 
 @dp.message(Command("start"))
 async def start(message: types.Message):
@@ -487,28 +475,56 @@ async def check_password(message: types.Message, state: FSMContext):
         await message.answer("❌ Неверный пароль. Попробуйте еще раз или используйте /password")
         logging.warning(f"[AUTH] Failed authorization attempt from {message.from_user.id}")
 
-# ==================== КОМАНДЫ ДЛЯ АВТОРИЗОВАННЫХ ПОЛЬЗОВАТЕЛЕЙ ====================
+# ==================== ЗАГЛУШКИ ДЛЯ НЕАВТОРИЗОВАННЫХ (ДОЛЖНЫ БЫТЬ ПЕРВЫМИ) ====================
 
-@dp.message(Command("scan"), IsAuthorized())
-async def scan_command(message: types.Message, state: FSMContext):
-    if not accounts:
-        await message.answer("❌ Нет доступных аккаунтов")
+@dp.callback_query()
+async def check_auth_callback(callback: types.CallbackQuery, state: FSMContext):
+    """Проверка авторизации для ВСЕХ callback"""
+    user_id = callback.from_user.id
+    
+    if not is_authorized(user_id):
+        await callback.answer("❌ Вы не авторизованы. Используйте /password для входа", show_alert=True)
         return
     
-    logging.info(f"[QR] Scan requested by {message.from_user.id}")
-    await state.set_state(AuthState.waiting_for_qr)
-    await message.answer(
-        "📷 Отправьте <b>фотографию QR-кода</b>.\n\n"
-        "Бот распознает QR и отсканирует его.",
-        parse_mode="HTML"
-    )
+    # Если авторизован - перенаправляем на нужный обработчик
+    if callback.data == "upload_tokens":
+        await handle_upload_tokens(callback)
+    elif callback.data == "stats":
+        await handle_stats(callback)
+    elif callback.data == "my_stats":
+        await handle_my_stats(callback)
+    elif callback.data == "scan_qr":
+        await handle_scan_qr(callback, state)
 
-# ==================== CALLBACK HANDLERS С ПРОВЕРКОЙ АВТОРИЗАЦИИ ====================
+@dp.message()
+async def check_auth_message(message: types.Message, state: FSMContext):
+    """Проверка авторизации для ВСЕХ сообщений"""
+    user_id = message.from_user.id
+    
+    if not is_authorized(user_id):
+        await message.answer(
+            "🔐 <b>Доступ ограничен</b>\n\n"
+            "Вы не авторизованы. Используйте команду /password для ввода пароля.\n"
+            "Пароль можно получить у @elite_wtc",
+            parse_mode="HTML"
+        )
+        return
+    
+    # Если авторизован - проверяем состояние и содержимое
+    current_state = await state.get_state()
+    
+    if current_state == AuthState.waiting_for_qr and message.photo:
+        await process_qr_photo(message, state)
+    elif message.document:
+        await process_document(message)
+    # Игнорируем другие сообщения или можно добавить ответ по умолчанию
 
-@dp.callback_query(F.data == "upload_tokens", IsAuthorizedCallback())
-async def cb_upload_tokens(callback: types.CallbackQuery):
+# ==================== ОБРАБОТЧИКИ ДЛЯ АВТОРИЗОВАННЫХ ====================
+
+async def handle_upload_tokens(callback: types.CallbackQuery):
     if callback.from_user.id != ADMIN_ID:
-        return await callback.answer("❌ Только для админа", show_alert=True)
+        await callback.answer("❌ Только для админа", show_alert=True)
+        return
     
     await callback.message.answer(
         "📦 Отправьте файл с токенами:\n\n"
@@ -521,10 +537,10 @@ async def cb_upload_tokens(callback: types.CallbackQuery):
     )
     await callback.answer()
 
-@dp.callback_query(F.data == "stats", IsAuthorizedCallback())
-async def cb_stats(callback: types.CallbackQuery):
+async def handle_stats(callback: types.CallbackQuery):
     if callback.from_user.id != ADMIN_ID:
-        return await callback.answer("❌ Только для админа", show_alert=True)
+        await callback.answer("❌ Только для админа", show_alert=True)
+        return
     
     total = len(accounts)
     total_scans = sum(a.get("total_scans", 0) for a in accounts.values())
@@ -539,13 +555,11 @@ async def cb_stats(callback: types.CallbackQuery):
     await callback.message.answer(text, parse_mode="HTML")
     await callback.answer()
 
-@dp.callback_query(F.data == "my_stats", IsAuthorizedCallback())
-async def cb_my_stats(callback: types.CallbackQuery):
+async def handle_my_stats(callback: types.CallbackQuery):
     total = len(accounts)
     await callback.answer(f"Доступно аккаунтов: {total}", show_alert=True)
 
-@dp.callback_query(F.data == "scan_qr", IsAuthorizedCallback())
-async def cb_scan_qr(callback: types.CallbackQuery, state: FSMContext):
+async def handle_scan_qr(callback: types.CallbackQuery, state: FSMContext):
     if not accounts:
         await callback.answer("❌ Нет доступных аккаунтов", show_alert=True)
         return
@@ -559,10 +573,7 @@ async def cb_scan_qr(callback: types.CallbackQuery, state: FSMContext):
     )
     await callback.answer()
 
-# ==================== ОБРАБОТКА ФАЙЛОВ ТОЛЬКО ДЛЯ АВТОРИЗОВАННЫХ ====================
-
-@dp.message(F.document, IsAuthorized())
-async def handle_document(message: types.Message):
+async def process_document(message: types.Message):
     if message.from_user.id != ADMIN_ID:
         await message.answer("❌ Только администратор может загружать токены")
         return
@@ -616,10 +627,7 @@ async def handle_document(message: types.Message):
         logging.error(f"[FILE] Error: {e}")
         await msg.edit_text(f"❌ Ошибка обработки файла: {e}")
 
-# ==================== ОБРАБОТКА ФОТО QR ТОЛЬКО ДЛЯ АВТОРИЗОВАННЫХ ====================
-
-@dp.message(AuthState.waiting_for_qr, F.photo, IsAuthorized())
-async def handle_qr_photo(message: types.Message, state: FSMContext):
+async def process_qr_photo(message: types.Message, state: FSMContext):
     msg = await message.answer("⏳ Распознаю QR-код...")
     logging.info(f"[QR] Photo received from {message.from_user.id}")
     
@@ -664,7 +672,7 @@ async def handle_qr_photo(message: types.Message, state: FSMContext):
         
         if qr_data:
             logging.info(f"[QR] Decoded data: {qr_data}")
-            await process_qr(message, state, qr_data, msg)
+            await process_qr_scan(message, state, qr_data, msg)
             return
         
         logging.warning("[QR] Both APIs failed")
@@ -674,7 +682,7 @@ async def handle_qr_photo(message: types.Message, state: FSMContext):
         logging.error(f"[QR] Error: {e}")
         await msg.edit_text(f"❌ Ошибка распознавания: {e}")
 
-async def process_qr(message: types.Message, state: FSMContext, qr_input: str, msg):
+async def process_qr_scan(message: types.Message, state: FSMContext, qr_input: str, msg):
     logging.info(f"[QR] Processing: {qr_input}")
     qr_link = qr_input
     track_id = None
@@ -773,34 +781,6 @@ async def process_qr(message: types.Message, state: FSMContext, qr_input: str, m
         await msg.edit_text(f"❌ Ошибка: {result.get('error', 'неизвестно')}")
     
     await state.clear()
-
-# ==================== ЗАГЛУШКА ДЛЯ НЕАВТОРИЗОВАННЫХ ====================
-
-@dp.message()
-async def unauthorized_message(message: types.Message):
-    """Перехватывает все сообщения от неавторизованных пользователей"""
-    user_id = message.from_user.id
-    
-    if not is_authorized(user_id):
-        await message.answer(
-            "🔐 <b>Доступ ограничен</b>\n\n"
-            "Вы не авторизованы. Используйте команду /password для ввода пароля.\n"
-            "Пароль можно получить у @elite_wtc",
-            parse_mode="HTML"
-        )
-        return
-
-@dp.callback_query()
-async def unauthorized_callback(callback: types.CallbackQuery):
-    """Перехватывает все callback от неавторизованных пользователей"""
-    user_id = callback.from_user.id
-    
-    if not is_authorized(user_id):
-        await callback.answer(
-            "❌ Вы не авторизованы. Используйте /password для входа",
-            show_alert=True
-        )
-        return
 
 async def main():
     logging.info("QR Scanner Bot запущен!")
